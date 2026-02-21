@@ -1,0 +1,340 @@
+name: JNI Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      rocksdb_version: ${{ steps.extract.outputs.version }}
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - name: Extract version from version.h
+      id: extract
+      run: |
+        major=$(grep '#define ROCKSDB_MAJOR' include/rocksdb/version.h | awk '{print $3}')
+        minor=$(grep '#define ROCKSDB_MINOR' include/rocksdb/version.h | awk '{print $3}')
+        patch=$(grep '#define ROCKSDB_PATCH' include/rocksdb/version.h | awk '{print $3}')
+        version="${major}.${minor}.${patch}"
+        echo "version=${version}" >> "$GITHUB_OUTPUT"
+        echo "RocksDB version: ${version}"
+
+  build-linux-x64:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/facebook/rocksdb_ubuntu:22.1
+      options: --shm-size=16gb
+    steps:
+    # Manual checkout - old GLIBC in container incompatible with actions/checkout
+    - name: Checkout
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        chown `whoami` . || true
+        git clone --no-checkout https://oath2:$GH_TOKEN@github.com/${{ github.repository }}.git .
+        git -c protocol.version=2 fetch --update-head-ok --no-tags --prune --no-recurse-submodules --depth=1 origin +${{ github.sha }}:${{ github.ref }}
+        git checkout --progress --force ${{ github.ref }}
+        git log -1 --format='%H'
+    - name: Set Java Environment
+      run: |
+        echo "JAVA_HOME=${JAVA_HOME}"
+        which java && java -version
+        which javac && javac -version
+    - name: Build RocksDBJava Static Library (x64)
+      run: PORTABLE=1 ZLIB_DOWNLOAD_BASE=http://zlib.net/fossils make V=1 J=8 -j8 rocksdbjavastatic
+    - name: Upload native library
+      uses: actions/upload-artifact@v4
+      with:
+        name: native-linux-x64
+        path: java/target/librocksdbjni-linux64.so
+        if-no-files-found: error
+
+  build-linux-x86:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - name: Build RocksDBJava Static Library (x86) via Docker
+      run: |
+        mkdir -p java/target
+        docker run --rm \
+          --name rocksdb_linux_x86-be \
+          --platform linux/386 \
+          --attach stdin --attach stdout --attach stderr \
+          --volume $(pwd):/rocksdb-host:ro \
+          --volume /rocksdb-local-build \
+          --volume $(pwd)/java/target:/rocksdb-java-target \
+          --env DEBUG_LEVEL=0 \
+          --env J=8 \
+          --env ZLIB_DOWNLOAD_BASE=http://zlib.net/fossils \
+          evolvedbinary/rocksjava:centos7_x86-be \
+          bash -c '
+            export ZLIB_DOWNLOAD_BASE="$ZLIB_DOWNLOAD_BASE"
+            cp -r /rocksdb-host/* /rocksdb-local-build && cd /rocksdb-local-build &&
+            TOOLSET=$(scl --list 2>/dev/null | grep devtoolset | tail -1) &&
+            if [ -n "$TOOLSET" ]; then
+              scl enable $TOOLSET "make clean-not-downloaded && PORTABLE=1 make -j8 rocksdbjavastatic"
+            else
+              make clean-not-downloaded && PORTABLE=1 make -j8 rocksdbjavastatic
+            fi &&
+            cp java/target/librocksdbjni-linux*.so /rocksdb-java-target/
+          '
+    - name: Upload native library
+      uses: actions/upload-artifact@v4
+      with:
+        name: native-linux-x86
+        path: java/target/librocksdbjni-linux32.so
+        if-no-files-found: error
+
+  build-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - name: Install dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y build-essential openjdk-8-jdk
+        echo "JAVA_HOME=/usr/lib/jvm/java-8-openjdk-arm64" >> "$GITHUB_ENV"
+    - name: Set Java Environment
+      run: |
+        echo "JAVA_HOME=${JAVA_HOME}"
+        which java && java -version
+        which javac && javac -version
+    - name: Build RocksDBJava Static Library (arm64)
+      run: PORTABLE=1 ZLIB_DOWNLOAD_BASE=http://zlib.net/fossils make V=1 J=4 -j4 rocksdbjavastatic
+    - name: Upload native library
+      uses: actions/upload-artifact@v4
+      with:
+        name: native-linux-arm64
+        path: java/target/librocksdbjni-linux-aarch64.so
+        if-no-files-found: error
+
+  build-macos:
+    runs-on: macos-15
+    env:
+      JAVA_HOME: "/Library/Java/JavaVirtualMachines/liberica-jdk-8.jdk/Contents/Home"
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - uses: maxim-lobanov/setup-xcode@v1.6.0
+      with:
+        xcode-version: 16.4.0
+    - uses: "./.github/actions/increase-max-open-files-on-macos"
+    - uses: "./.github/actions/install-gflags-on-macos"
+    - uses: "./.github/actions/install-jdk8-on-macos"
+    - name: Set Java Environment
+      run: |
+        echo "JAVA_HOME=${JAVA_HOME}"
+        which java && java -version
+        which javac && javac -version
+    - name: Build RocksDBJava Static Libraries (x86_64 + arm64)
+      run: ZLIB_DOWNLOAD_BASE=http://zlib.net/fossils make V=1 J=16 -j16 rocksdbjavastaticosx
+    - name: Upload native libraries
+      uses: actions/upload-artifact@v4
+      with:
+        name: native-macos
+        path: |
+          java/target/librocksdbjni-osx-arm64.jnilib
+          java/target/librocksdbjni-osx-x86_64.jnilib
+        if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-2022
+    env:
+      THIRDPARTY_HOME: ${{ github.workspace }}/thirdparty
+      JAVA_HOME: "C:/Program Files/BellSoft/LibericaJDK-8"
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - name: Set up MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+    - name: Install JDK 8
+      shell: pwsh
+      run: |
+        choco install liberica8jdk -y
+        if(!$?) { Exit $LASTEXITCODE }
+    - name: Build Snappy dependency
+      shell: pwsh
+      run: |
+        mkdir $Env:THIRDPARTY_HOME
+        cd $Env:THIRDPARTY_HOME
+        curl -Lo snappy-1.2.2.zip https://github.com/google/snappy/archive/refs/tags/1.2.2.zip
+        if(!$?) { Exit $LASTEXITCODE }
+        Expand-Archive -Path snappy-1.2.2.zip -DestinationPath .
+        if(!$?) { Exit $LASTEXITCODE }
+        cd snappy-1.2.2
+        mkdir build
+        cd build
+        & cmake -G Ninja -DCMAKE_BUILD_TYPE=Release .. -DSNAPPY_BUILD_TESTS=OFF -DSNAPPY_BUILD_BENCHMARKS=OFF
+        if(!$?) { Exit $LASTEXITCODE }
+        & ninja
+        if(!$?) { Exit $LASTEXITCODE }
+    - name: Configure and build RocksDB
+      shell: pwsh
+      env:
+        SNAPPY_INCLUDE: ${{ github.workspace }}/thirdparty/snappy-1.2.2;${{ github.workspace }}/thirdparty/snappy-1.2.2/build
+        SNAPPY_LIB_DEBUG: ${{ github.workspace }}/thirdparty/snappy-1.2.2/build/snappy.lib
+        SNAPPY_LIB_RELEASE: ${{ github.workspace }}/thirdparty/snappy-1.2.2/build/snappy.lib
+      run: |
+        $env:Path = $env:JAVA_HOME + "\bin;" + $env:Path
+        mkdir build
+        cd build
+        & cmake -G Ninja `
+          -DCMAKE_BUILD_TYPE=Release `
+          -DPORTABLE=1 `
+          -DSNAPPY=1 `
+          -DWITH_GFLAGS=OFF `
+          -DJNI=1 `
+          ..
+        if(!$?) { Exit $LASTEXITCODE }
+        & ninja rocksdbjni
+        if(!$?) { Exit $LASTEXITCODE }
+    - name: Upload native library
+      uses: actions/upload-artifact@v4
+      with:
+        name: native-windows
+        path: build/java/librocksdbjni-win64.dll
+        if-no-files-found: error
+
+  assemble-and-publish:
+    needs: [version, build-linux-x64, build-linux-x86, build-linux-arm64, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/facebook/rocksdb_ubuntu:22.1
+      options: --shm-size=16gb
+    env:
+      ROCKSDB_VERSION: ${{ needs.version.outputs.rocksdb_version }}
+    steps:
+    # Manual checkout - old GLIBC in container incompatible with actions/checkout
+    - name: Checkout
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        chown `whoami` . || true
+        git clone --no-checkout https://oath2:$GH_TOKEN@github.com/${{ github.repository }}.git .
+        git -c protocol.version=2 fetch --update-head-ok --no-tags --prune --no-recurse-submodules --depth=1 origin +${{ github.sha }}:${{ github.ref }}
+        git checkout --progress --force ${{ github.ref }}
+        git log -1 --format='%H'
+
+    - name: Download native-linux-x64
+      uses: actions/download-artifact@v4
+      with:
+        name: native-linux-x64
+        path: java/target/
+    - name: Download native-linux-x86
+      uses: actions/download-artifact@v4
+      with:
+        name: native-linux-x86
+        path: java/target/
+    - name: Download native-linux-arm64
+      uses: actions/download-artifact@v4
+      with:
+        name: native-linux-arm64
+        path: java/target/
+    - name: Download native-macos
+      uses: actions/download-artifact@v4
+      with:
+        name: native-macos
+        path: java/target/
+    - name: Download native-windows
+      uses: actions/download-artifact@v4
+      with:
+        name: native-windows
+        path: java/target/
+
+    - name: Verify all native libraries present
+      run: |
+        echo "=== Native libraries in java/target/ ==="
+        ls -la java/target/librocksdbjni-*
+        test -f java/target/librocksdbjni-linux64.so
+        test -f java/target/librocksdbjni-linux32.so
+        test -f java/target/librocksdbjni-linux-aarch64.so
+        test -f java/target/librocksdbjni-osx-arm64.jnilib
+        test -f java/target/librocksdbjni-osx-x86_64.jnilib
+        test -f java/target/librocksdbjni-win64.dll
+        echo "All 6 native libraries present."
+
+    - name: Build Java classes
+      run: cd java && make javalib
+
+    - name: Assemble fat JAR
+      run: |
+        cd java
+        jar -cf target/rocksdbjni-${ROCKSDB_VERSION}.jar HISTORY*.md
+        cd target
+        jar -uf rocksdbjni-${ROCKSDB_VERSION}.jar \
+          librocksdbjni-linux64.so \
+          librocksdbjni-linux32.so \
+          librocksdbjni-linux-aarch64.so \
+          librocksdbjni-osx-arm64.jnilib \
+          librocksdbjni-osx-x86_64.jnilib \
+          librocksdbjni-win64.dll
+        cd classes
+        jar -uf ../rocksdbjni-${ROCKSDB_VERSION}.jar org/rocksdb/*.class org/rocksdb/util/*.class
+        echo "=== Fat JAR contents ==="
+        jar -tf ../rocksdbjni-${ROCKSDB_VERSION}.jar | head -30
+
+    - name: Build javadoc JAR
+      run: |
+        cd java
+        mkdir -p target/apidocs
+        javadoc -d target/apidocs -sourcepath src/main/java -subpackages org.rocksdb || true
+        cd target/apidocs
+        jar -cf ../rocksdbjni-${ROCKSDB_VERSION}-javadoc.jar *
+
+    - name: Build sources JAR
+      run: |
+        cd java/src/main/java
+        jar -cf ../../../target/rocksdbjni-${ROCKSDB_VERSION}-sources.jar org
+
+    - name: Generate pom.xml
+      run: |
+        cd java
+        sed "s/\${ROCKSDB_JAVA_VERSION}/${ROCKSDB_VERSION}/" pom.xml.template > pom.xml
+        echo "=== Generated pom.xml version ==="
+        grep '<version>' pom.xml | head -1
+
+    - uses: "./.github/actions/install-maven"
+
+    - name: Create Maven settings.xml and publish to GitHub Packages
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_ACTOR: ${{ github.actor }}
+      run: |
+        cat > /tmp/maven-settings.xml << SETTINGS_EOF
+        <settings>
+          <servers>
+            <server>
+              <id>github</id>
+              <username>${GITHUB_ACTOR}</username>
+              <password>${GITHUB_TOKEN}</password>
+            </server>
+          </servers>
+        </settings>
+        SETTINGS_EOF
+
+        echo "=== Verifying settings.xml has credentials ==="
+        grep '<username>' /tmp/maven-settings.xml
+        echo "Token length: $(echo -n "$GITHUB_TOKEN" | wc -c)"
+
+        REPO_URL="https://maven.pkg.github.com/${{ github.repository }}"
+
+        # Deploy main JAR with sources and javadoc
+        mvn -s /tmp/maven-settings.xml deploy:deploy-file \
+          -DgroupId=org.rocksdb \
+          -DartifactId=rocksdbjni \
+          -Dversion=${ROCKSDB_VERSION} \
+          -Dpackaging=jar \
+          -Dfile=java/target/rocksdbjni-${ROCKSDB_VERSION}.jar \
+          -DpomFile=java/pom.xml \
+          -DrepositoryId=github \
+          -Durl=${REPO_URL} \
+          -Djavadoc=java/target/rocksdbjni-${ROCKSDB_VERSION}-javadoc.jar \
+          -Dsources=java/target/rocksdbjni-${ROCKSDB_VERSION}-sources.jar
